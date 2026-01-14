@@ -12,8 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import queue
 from urllib.parse import urlparse
-import folium
-from folium.plugins import MarkerCluster, AntPath
+import plotly.graph_objects as go
 import argparse
 
 INDEX = "adstash-ospool-transfer-*"
@@ -367,24 +366,40 @@ def get_site_info(site_name, resource_groups):
     return None
 
 
+def format_bytes(num_bytes):
+    """Format bytes into human-readable string (KB, MB, GB, TB)."""
+    if num_bytes is None:
+        return "N/A"
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
+        if abs(num_bytes) < 1024.0:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.1f} EB"
+
+
 def endpoint_to_site_map():
     """Create a map from endpoint to execution sites (glidein resource names)."""
     conn = duckdb.connect("transfers.duckdb", read_only=True)
     
     result = conn.execute("""
-        SELECT endpoint, machine_attr_glidein_resourcename0 as site, COUNT(*) as count
+        SELECT 
+            endpoint, 
+            machine_attr_glidein_resourcename0 as site, 
+            COUNT(*) as count,
+            SUM(COALESCE(transfer_total_bytes, 0)) as total_bytes,
+            COUNT(DISTINCT transfer_file_name) as unique_objects
         FROM transfers
         WHERE endpoint IS NOT NULL AND machine_attr_glidein_resourcename0 IS NOT NULL
         GROUP BY endpoint, machine_attr_glidein_resourcename0
         ORDER BY endpoint, count DESC
     """).fetchall()
     
-    # Build map: endpoint -> list of (site, count)
+    # Build map: endpoint -> list of (site, count, total_bytes, unique_objects)
     endpoint_map = {}
-    for endpoint, site, count in result:
+    for endpoint, site, count, total_bytes, unique_objects in result:
         if endpoint not in endpoint_map:
             endpoint_map[endpoint] = []
-        endpoint_map[endpoint].append((site, count))
+        endpoint_map[endpoint].append((site, count, total_bytes, unique_objects))
     
     conn.close()
     return endpoint_map
@@ -400,17 +415,21 @@ def build_endpoint_site_data():
     
     for endpoint in sorted(endpoint_map.keys()):
         sites = endpoint_map[endpoint]
-        total_transfers = sum(count for _, count in sites)
+        total_transfers = sum(count for _, count, _, _ in sites)
+        total_bytes = sum(bytes_transferred for _, _, bytes_transferred, _ in sites)
+        total_objects = sum(objects for _, _, _, objects in sites)
         
         # Look up server info
         server = lookup_server(endpoint, server_info)
         
         # Build site entries with resource group info
         site_entries = []
-        for site_name, count in sites:
+        for site_name, count, bytes_transferred, unique_objects in sites:
             site_entry = {
                 "name": site_name,
                 "count": count,
+                "bytes": bytes_transferred,
+                "objects": unique_objects,
                 "percentage": round(100 * count / total_transfers, 2)
             }
             
@@ -433,6 +452,8 @@ def build_endpoint_site_data():
         entry = {
             "endpoint": endpoint,
             "total_transfers": total_transfers,
+            "total_bytes": total_bytes,
+            "total_objects": total_objects,
             "sites": site_entries
         }
         
@@ -501,18 +522,72 @@ def print_endpoint_site_map():
             print(f"    ... and {len(sites) - 10} more")
 
 
+def lat_to_mercator_y(lat):
+    """Convert latitude to Web Mercator y-coordinate."""
+    # Clamp latitude to avoid infinity at poles
+    lat = max(-85, min(85, lat))
+    lat_rad = math.radians(lat)
+    return math.log(math.tan(math.pi / 4 + lat_rad / 2))
+
+
+def mercator_y_to_lat(y):
+    """Convert Web Mercator y-coordinate back to latitude."""
+    return math.degrees(2 * math.atan(math.exp(y)) - math.pi / 2)
+
+
+def calculate_midpoint_mercator(lat1, lon1, lat2, lon2):
+    """Calculate the visual midpoint of a line on a Web Mercator map.
+    
+    Simple lat/lon averaging doesn't work because Web Mercator distorts
+    latitude non-linearly. This converts to Mercator, averages, then converts back.
+    """
+    # Longitude is linear in Mercator, so simple average works
+    mid_lon = (lon1 + lon2) / 2
+    
+    # Latitude needs to be averaged in Mercator space
+    y1 = lat_to_mercator_y(lat1)
+    y2 = lat_to_mercator_y(lat2)
+    mid_y = (y1 + y2) / 2
+    mid_lat = mercator_y_to_lat(mid_y)
+    
+    return mid_lat, mid_lon
+
+
+def calculate_arrow_angle(start_lat, start_lon, end_lat, end_lon):
+    """Calculate the angle (in degrees) for an arrow pointing from start to end.
+    
+    Uses Mercator projection coordinates for accurate angle on the map.
+    Plotly's triangle marker points up (north) at angle=0, and rotates clockwise.
+    """
+    # Calculate angle in Mercator space - both dx and dy must be in same units
+    # Mercator x = R * lon_radians, Mercator y = R * ln(tan(π/4 + lat/2))
+    # So we convert lon to radians to match the scale of mercator_y
+    dx = math.radians(end_lon - start_lon)
+    dy = lat_to_mercator_y(end_lat) - lat_to_mercator_y(start_lat)
+    
+    if dx == 0 and dy == 0:
+        return 0
+    
+    # atan2: 0=east, 90=north, 180=west, -90=south (counter-clockwise from east)
+    angle_rad = math.atan2(dy, dx)
+    angle_deg = math.degrees(angle_rad)
+    
+    # Plotly: 0=north(up), 90=east(right), 180=south(down), 270=west(left) (clockwise from north)
+    # Convert: plotly_angle = 90 - atan2_angle
+    return 90 - angle_deg
+
+
 def create_transfer_map(output_file="transfer_map.html", show_connections=False, 
                         site_filter=None, min_transfers=0):
-    """Create an interactive geographic map of OSDF transfers.
+    """Create an interactive geographic map of OSDF transfers using Plotly.
     
     Args:
         output_file: Output HTML file path
-        show_connections: Whether to show transfer flow lines
+        show_connections: Whether to show transfer flow lines with arrows
         site_filter: If set, only show data related to this site (partial match)
         min_transfers: Minimum number of transfers to include a connection
     """
     data = build_endpoint_site_data()
-    resource_groups = load_resource_groups()
     
     # Filter by site if specified
     if site_filter:
@@ -543,23 +618,20 @@ def create_transfer_map(output_file="transfer_map.html", show_connections=False,
         print("No endpoints with location data found")
         return
     
-    # Create the map centered on US
-    m = folium.Map(location=[39.8283, -98.5795], zoom_start=4, tiles="CartoDB positron")
-    
-    # Create feature groups for layers
-    origin_layer = folium.FeatureGroup(name="Origin Servers")
-    cache_layer = folium.FeatureGroup(name="Cache Servers")
-    site_layer = folium.FeatureGroup(name="Execution Sites")
-    connection_layer = folium.FeatureGroup(name="Transfer Connections", show=False)
-    
     # Find max transfers for scaling
     max_transfers = max(e["total_transfers"] for e in endpoints_with_location)
     
-    # Color by server type
-    type_colors = {
-        "Origin": "#e74c3c",  # Red
-        "Cache": "#3498db",   # Blue
-    }
+    # Collect data for plotly traces
+    origin_lats, origin_lons, origin_texts, origin_hovers = [], [], [], []
+    cache_lats, cache_lons, cache_texts, cache_hovers = [], [], [], []
+    site_lats, site_lons, site_texts, site_hovers = [], [], [], []
+    
+    # Arrow line coordinates and widths (using None to separate lines)
+    arrow_lats, arrow_lons = [], []
+    arrow_line_widths = []  # Width for each line segment (based on transfer count)
+    # Arrow head markers (fixed pixel size, won't scale with zoom) - placed at midpoint
+    arrow_head_lats, arrow_head_lons, arrow_head_angles = [], [], []
+    arrow_head_hovers = []  # Hover text for each arrow
     
     # Track unique sites to avoid duplicates
     seen_sites = set()
@@ -567,7 +639,7 @@ def create_transfer_map(output_file="transfer_map.html", show_connections=False,
     # Track coordinates to offset overlapping markers
     coord_counts = {}
     
-    # Add markers for each endpoint
+    # Process each endpoint
     for entry in endpoints_with_location:
         server = entry["server"]
         endpoint_lat = server["latitude"]
@@ -581,65 +653,50 @@ def create_transfer_map(output_file="transfer_map.html", show_connections=False,
         coord_key = (round(endpoint_lat, 4), round(endpoint_lon, 4))
         if coord_key in coord_counts:
             coord_counts[coord_key] += 1
-            # Spiral pattern offset
             n = coord_counts[coord_key]
             angle = n * 2.4  # Golden angle for even distribution
-            offset = 0.15 * math.sqrt(n)  # Increase distance with count
+            offset = 0.15 * math.sqrt(n)
             endpoint_lat += offset * math.cos(angle)
             endpoint_lon += offset * math.sin(angle)
         else:
             coord_counts[coord_key] = 0
         
-        # Scale radius by transfer volume (sqrt scale for better visualization)
-        transfer_ratio = entry["total_transfers"] / max_transfers
-        radius = 5 + 25 * math.sqrt(transfer_ratio)  # 5-30 range
-        
-        # Get color by type
         server_type = server.get("type", "Unknown")
-        color = type_colors.get(server_type, "#95a5a6")
+        server_name = server.get('name', entry['endpoint'])
         
-        # Build popup content
+        # Build hover text
         top_sites = entry["sites"][:5]
-        sites_html = "".join(
-            f"<tr><td>{s['name']}</td><td>{s['count']:,}</td><td>{s['percentage']:.1f}%</td></tr>"
+        sites_list = "<br>".join(
+            f"  • {s['name']}: {s['count']:,} ({s['percentage']:.1f}%)"
             for s in top_sites
         )
-        
         namespaces = server.get("namespaces", [])[:3]
         namespaces_str = ", ".join(namespaces) if namespaces else "N/A"
         
-        popup_html = f"""
-        <div style="min-width: 300px">
-            <h4>{server.get('name', entry['endpoint'])}</h4>
-            <p><b>Endpoint:</b> {entry['endpoint']}</p>
-            <p><b>Type:</b> {server_type}</p>
-            <p><b>Total Transfers:</b> {entry['total_transfers']:,}</p>
-            <p><b>Namespaces:</b> {namespaces_str}</p>
-            <p><b>Version:</b> {server.get('version', 'N/A')}</p>
-            <p><b>Status:</b> {server.get('health_status', 'N/A')}</p>
-            <h5>Top Sites:</h5>
-            <table style="width:100%">
-                <tr><th>Site</th><th>Count</th><th>%</th></tr>
-                {sites_html}
-            </table>
-        </div>
-        """
+        hover_text = (
+            f"<b>{server_name}</b><br>"
+            f"Endpoint: {entry['endpoint']}<br>"
+            f"Type: {server_type}<br>"
+            f"Total Transfers: {entry['total_transfers']:,}<br>"
+            f"Namespaces: {namespaces_str}<br>"
+            f"Version: {server.get('version', 'N/A')}<br>"
+            f"Status: {server.get('health_status', 'N/A')}<br>"
+            f"<b>Top Sites:</b><br>{sites_list}"
+        )
         
-        # Choose layer based on server type
-        target_layer = origin_layer if server_type == "Origin" else cache_layer
+        # Add to appropriate list based on server type
+        if server_type == "Origin":
+            origin_lats.append(endpoint_lat)
+            origin_lons.append(endpoint_lon)
+            origin_texts.append(server_name)
+            origin_hovers.append(hover_text)
+        else:
+            cache_lats.append(endpoint_lat)
+            cache_lons.append(endpoint_lon)
+            cache_texts.append(server_name)
+            cache_hovers.append(hover_text)
         
-        folium.CircleMarker(
-            location=[endpoint_lat, endpoint_lon],
-            radius=radius,
-            color=color,
-            fill=True,
-            fill_color=color,
-            fill_opacity=0.6,
-            popup=folium.Popup(popup_html, max_width=400),
-            tooltip=f"{server.get('name', entry['endpoint'])}: {entry['total_transfers']:,} transfers"
-        ).add_to(target_layer)
-        
-        # Add site markers and connection lines
+        # Process sites and connections
         for site in entry["sites"]:
             site_name = site["name"]
             site_loc = site.get("location")
@@ -655,79 +712,180 @@ def create_transfer_map(output_file="transfer_map.html", show_connections=False,
                 # Add site marker (only once per site)
                 if site_name not in seen_sites:
                     seen_sites.add(site_name)
-                    
-                    site_popup = f"""
-                    <div style="min-width: 200px">
-                        <h4>{site_name}</h4>
-                        <p><b>Facility:</b> {site.get('facility', 'N/A')}</p>
-                        <p><b>Location:</b> {site_loc.get('city', 'N/A')}, {site_loc.get('country', 'N/A')}</p>
-                        <p><b>Description:</b> {site_loc.get('description', 'N/A')}</p>
-                    </div>
-                    """
-                    
-                    folium.CircleMarker(
-                        location=[site_lat, site_lon],
-                        radius=6,
-                        color="#27ae60",  # Green
-                        fill=True,
-                        fill_color="#27ae60",
-                        fill_opacity=0.7,
-                        popup=folium.Popup(site_popup, max_width=300),
-                        tooltip=site_name
-                    ).add_to(site_layer)
+                    site_lats.append(site_lat)
+                    site_lons.append(site_lon)
+                    site_texts.append(site_name)
+                    site_hovers.append(
+                        f"<b>{site_name}</b><br>"
+                        f"Facility: {site.get('facility', 'N/A')}<br>"
+                        f"Location: {site_loc.get('city', 'N/A')}, {site_loc.get('country', 'N/A')}<br>"
+                        f"Description: {site_loc.get('description', 'N/A')}"
+                    )
                 
-                # Add connection line (if enabled)
+                # Add connection arrow (if enabled and meets threshold)
                 if show_connections and site["count"] >= min_transfers:
-                    # Line weight based on percentage
-                    weight = 1 + (site["percentage"] / 20)
+                    transfer_count = site["count"]
+                    transfer_bytes = site.get("bytes", 0)
+                    transfer_objects = site.get("objects", 0)
                     
-                    # Use AntPath for animated directional arrows
-                    # Direction: site → endpoint (execution site to origin/cache server)
-                    AntPath(
-                        locations=[[site_lat, site_lon], [endpoint_lat, endpoint_lon]],
-                        weight=weight,
-                        color="#9b59b6",  # Purple
-                        pulse_color="#ffffff",
-                        delay=1000,  # Animation speed
-                        dash_array=[10, 20],  # Dash pattern for arrow effect
-                        tooltip=f"{site_name} → {server.get('name', entry['endpoint'])}: {site['count']:,} ({site['percentage']:.1f}%)"
-                    ).add_to(connection_layer)
+                    # Add line segment (with None separator)
+                    arrow_lats.extend([site_lat, endpoint_lat, None])
+                    arrow_lons.extend([site_lon, endpoint_lon, None])
+                    arrow_line_widths.append(transfer_count)
+                    
+                    # Calculate midpoint in Mercator projection for accurate placement
+                    mid_lat, mid_lon = calculate_midpoint_mercator(
+                        site_lat, site_lon, endpoint_lat, endpoint_lon
+                    )
+                    
+                    # Add arrow head marker at midpoint (fixed pixel size)
+                    angle = calculate_arrow_angle(site_lat, site_lon, endpoint_lat, endpoint_lon)
+                    arrow_head_lats.append(mid_lat)
+                    arrow_head_lons.append(mid_lon)
+                    arrow_head_angles.append(angle)
+                    
+                    # Create hover text for this transfer connection
+                    arrow_hover = (
+                        f"<b>Transfer Flow</b><br>"
+                        f"From: {site_name}<br>"
+                        f"To: {server_name}<br>"
+                        f"Transfers: {transfer_count:,}<br>"
+                        f"Objects: {transfer_objects:,}<br>"
+                        f"Data Transferred: {format_bytes(transfer_bytes)}"
+                    )
+                    arrow_head_hovers.append(arrow_hover)
     
-    # Add layers to map
-    origin_layer.add_to(m)
-    cache_layer.add_to(m)
-    site_layer.add_to(m)
-    connection_layer.add_to(m)
+    # Create figure
+    fig = go.Figure()
     
-    # Add layer control
-    folium.LayerControl().add_to(m)
+    # Add connection lines (arrows) first so they're behind markers
+    if show_connections and arrow_line_widths:
+        # Calculate line widths based on transfer counts (log scale for better visualization)
+        max_count = max(arrow_line_widths) if arrow_line_widths else 1
+        min_count = min(arrow_line_widths) if arrow_line_widths else 1
+        
+        # Scale line widths: min 1px, max 8px, using log scale
+        def scale_width(count):
+            if max_count == min_count:
+                return 3
+            # Log scale to handle large differences in transfer counts
+            log_range = math.log(max_count) - math.log(min_count) if min_count > 0 else 1
+            log_val = math.log(count) - math.log(min_count) if min_count > 0 else 0
+            normalized = log_val / log_range if log_range > 0 else 0.5
+            return 1 + normalized * 7  # Range: 1 to 8 pixels
+        
+        # Create individual line traces for variable widths
+        # Group into segments (each line is: start, end, None)
+        line_idx = 0
+        for i, count in enumerate(arrow_line_widths):
+            # Extract coordinates for this line segment
+            start_lat = arrow_lats[line_idx]
+            start_lon = arrow_lons[line_idx]
+            end_lat = arrow_lats[line_idx + 1]
+            end_lon = arrow_lons[line_idx + 1]
+            line_idx += 3  # Skip past None separator
+            
+            width = scale_width(count)
+            
+            fig.add_trace(go.Scattermap(
+                lat=[start_lat, end_lat],
+                lon=[start_lon, end_lon],
+                mode="lines",
+                line=dict(width=width, color="#9b59b6"),
+                name="Transfer Flow" if i == 0 else None,
+                showlegend=(i == 0),
+                hoverinfo="skip",
+                opacity=0.6
+            ))
+        
+        # Add arrow head markers at midpoint (fixed pixel size - won't scale with zoom)
+        if arrow_head_lats:
+            fig.add_trace(go.Scattermap(
+                lat=arrow_head_lats,
+                lon=arrow_head_lons,
+                mode="markers",
+                marker=dict(
+                    symbol="triangle",
+                    size=10,
+                    color="#9b59b6",
+                    angle=arrow_head_angles,  # Rotate each marker to point in direction
+                    allowoverlap=True
+                ),
+                hovertext=arrow_head_hovers,
+                hoverinfo="text",
+                name="Flow Direction",
+                showlegend=True
+            ))
     
-    # Build legend with dynamic info
-    filter_info = ""
+    # Add execution sites (green circles)
+    if site_lats:
+        fig.add_trace(go.Scattermap(
+            lat=site_lats,
+            lon=site_lons,
+            mode="markers",
+            marker=dict(size=12, color="#27ae60", opacity=0.8),
+            text=site_texts,
+            hovertext=site_hovers,
+            hoverinfo="text",
+            name="Execution Sites"
+        ))
+    
+    # Add origin servers (red circles)
+    if origin_lats:
+        fig.add_trace(go.Scattermap(
+            lat=origin_lats,
+            lon=origin_lons,
+            mode="markers",
+            marker=dict(size=14, color="#e74c3c", opacity=0.7),
+            text=origin_texts,
+            hovertext=origin_hovers,
+            hoverinfo="text",
+            name="Origin Servers"
+        ))
+    
+    # Add cache servers (blue circles)
+    if cache_lats:
+        fig.add_trace(go.Scattermap(
+            lat=cache_lats,
+            lon=cache_lons,
+            mode="markers",
+            marker=dict(size=14, color="#3498db", opacity=0.7),
+            text=cache_texts,
+            hovertext=cache_hovers,
+            hoverinfo="text",
+            name="Cache Servers"
+        ))
+    
+    # Build title with filter info
+    title_parts = ["OSDF Transfer Map"]
     if site_filter:
-        filter_info += f"<p style='font-size: 11px; color: #2980b9;'><b>Site filter:</b> {site_filter}</p>"
+        title_parts.append(f"Site: {site_filter}")
     if min_transfers > 0:
-        filter_info += f"<p style='font-size: 11px; color: #2980b9;'><b>Min transfers:</b> {min_transfers:,}</p>"
+        title_parts.append(f"Min transfers: {min_transfers:,}")
+    title = " | ".join(title_parts)
     
-    legend_html = f"""
-    <div style="position: fixed; bottom: 50px; left: 50px; z-index: 1000; 
-                background-color: white; padding: 10px; border-radius: 5px;
-                border: 2px solid grey; font-size: 14px;">
-        <p><b>OSDF Transfer Map</b></p>
-        <p><span style="color: #e74c3c;">●</span> Origin Server</p>
-        <p><span style="color: #3498db;">●</span> Cache Server</p>
-        <p><span style="color: #27ae60;">●</span> Execution Site</p>
-        <p><span style="color: #9b59b6;">―▸</span> Transfer Flow (animated)</p>
-        <p style="font-size: 11px; color: grey;">Endpoint size = transfer volume</p>
-        <p style="font-size: 11px; color: grey;">Arrows show direction of data flow</p>
-        <p style="font-size: 11px; color: grey;">Use layer control (top right) to toggle</p>
-        {filter_info}
-    </div>
-    """
-    m.get_root().html.add_child(folium.Element(legend_html))
+    # Update layout
+    fig.update_layout(
+        title=title,
+        map=dict(
+            style="carto-positron",
+            center=dict(lat=39.8283, lon=-98.5795),
+            zoom=3.5
+        ),
+        showlegend=True,
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0.01,
+            bgcolor="rgba(255, 255, 255, 0.8)"
+        ),
+        margin=dict(l=0, r=0, t=40, b=0),
+        height=800
+    )
     
-    # Save the map
-    m.save(output_file)
+    # Save to HTML
+    fig.write_html(output_file)
     print(f"\nCreated interactive map: {output_file}")
     print(f"  - {len(endpoints_with_location)} OSDF endpoints with location data")
     print(f"  - {len(data) - len(endpoints_with_location)} endpoints without location data")
@@ -737,7 +895,7 @@ def create_transfer_map(output_file="transfer_map.html", show_connections=False,
     if min_transfers > 0:
         print(f"  - Only showing connections with >= {min_transfers:,} transfers")
     if show_connections:
-        print(f"  - Connection arrows show data flow direction (site → server)")
+        print("  - Connection arrows show data flow direction (site → server)")
 
 
 def parse_geomap_args():
@@ -745,7 +903,7 @@ def parse_geomap_args():
     parser = argparse.ArgumentParser(description="Create OSDF transfer map")
     parser.add_argument("command", help="Command to run (geomap)")
     parser.add_argument("--connections", action="store_true",
-                        help="Show transfer flow lines with animated arrows")
+                        help="Show transfer flow lines with directional arrows")
     parser.add_argument("--site", type=str, default=None,
                         help="Filter to a specific site (e.g., 'Wisconsin', 'Nebraska', 'UCSD')")
     parser.add_argument("--min-transfers", type=int, default=0,
@@ -774,7 +932,7 @@ if __name__ == "__main__":
             print("Usage:")
             print("  python main.py map                  - Print and save endpoint-to-site mapping")
             print("  python main.py geomap               - Create geographic map")
-            print("  python main.py geomap --connections - Create map with animated flow arrows")
+            print("  python main.py geomap --connections - Create map with directional flow arrows")
             print("  python main.py geomap --site Wisconsin - Filter to specific site")
             print("  python main.py geomap --min-transfers 100 - Only show connections with 100+ transfers")
             print("  python main.py <start> <end>        - Fetch data from Elasticsearch")
