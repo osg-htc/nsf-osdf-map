@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 from elasticsearch import Elasticsearch
-from elasticsearch.dsl import Search
+from elasticsearch.dsl import Search, A
 import os
 import sys
 import duckdb
@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import queue
 from urllib.parse import urlparse
+import urllib.request
 import plotly.graph_objects as go
 import argparse
 
@@ -299,13 +300,28 @@ def main():
     conn.close()
 
 
+SERVERS_URL = "https://osdf-director.osg-htc.org/api/v1.0/director_ui/servers"
+RESOURCE_GROUP_URL = "https://map.osg-htc.org/api/resource_group_summary"
+
+
+def _fetch_json(url, cache_file):
+    """Return parsed JSON from cache_file if present, otherwise fetch from url and cache it."""
+    if os.path.exists(cache_file):
+        with open(cache_file) as f:
+            return json.load(f)
+    print(f"Fetching {url} ...")
+    with urllib.request.urlopen(url) as resp:
+        data = json.loads(resp.read().decode())
+    with open(cache_file, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"Cached to {cache_file}")
+    return data
+
+
 def load_server_info(servers_file="servers.json"):
-    """Load server info from servers.json and index by hostname."""
-    try:
-        with open(servers_file) as f:
-            servers = json.load(f)
-    except FileNotFoundError:
-        print(f"Warning: {servers_file} not found")
+    """Load server info, fetching from the OSDF director API if the local cache is missing."""
+    servers = _fetch_json(SERVERS_URL, servers_file)
+    if not servers:
         return {}
     
     # Index by hostname (extracted from URL) and also by full netloc
@@ -343,13 +359,30 @@ def lookup_server(endpoint, server_info):
 
 
 def load_resource_groups(resource_file="resource_group_summary.json"):
-    """Load resource group info (execution sites) from resource_group_summary.json."""
-    try:
-        with open(resource_file) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        print(f"Warning: {resource_file} not found")
+    """Load resource group info, fetching from the OSG topology API if the local cache is missing.
+
+    Returns a dict keyed by both resource group names (e.g., 'MTState-Tempest')
+    and individual resource/CE names (e.g., 'MTState-Tempest-CE1'), so that
+    direct CE-name lookups work without needing a separate reverse-lookup step.
+    """
+    raw = _fetch_json(RESOURCE_GROUP_URL, resource_file)
+    if not raw:
         return {}
+
+    # Start with the group-name-keyed entries, then index each individual resource
+    # by its own name so CE names (e.g. 'MTState-Tempest-CE1') resolve directly.
+    lookup = dict(raw)
+    for group_data in raw.values():
+        resources = group_data.get("Resources") or {}
+        resource_list = resources.get("Resource", [])
+        if isinstance(resource_list, dict):
+            resource_list = [resource_list]
+        for resource in resource_list:
+            res_name = resource.get("Name")
+            if res_name and res_name not in lookup:
+                lookup[res_name] = group_data
+
+    return lookup
 
 
 def get_site_info(site_name, resource_groups):
@@ -377,8 +410,181 @@ def format_bytes(num_bytes):
     return f"{num_bytes:.1f} EB"
 
 
+def endpoint_to_site_map_from_elasticsearch(start=None, end=None):
+    """Create a map from endpoint to execution sites using Elasticsearch aggregations.
+    
+    This is more efficient than fetching all documents and aggregating in DuckDB.
+    
+    Args:
+        start: Optional start timestamp (Unix timestamp)
+        end: Optional end timestamp (Unix timestamp)
+    
+    Returns:
+        dict: endpoint -> list of (site, count, total_bytes, unique_objects)
+    """
+    load_dotenv()
+    
+    # Connect to Elasticsearch with increased timeout for large aggregations
+    client = Elasticsearch(
+        hosts=os.getenv("ELASTIC_HOST"),
+        basic_auth=(os.getenv("ELASTIC_USER"), os.getenv("ELASTIC_PASSWORD")),
+        request_timeout=120,  # 2 minutes for large aggregation queries
+    )
+    
+    # Build the search query
+    s = Search(using=client, index=INDEX)
+    
+    # Add date range filter if provided
+    if start is not None and end is not None:
+        s = s.filter("range", RecordTime={"gte": start, "lte": end})
+    
+    # Add filter to exclude null values
+    # These field names match the actual document structure
+    s = s.filter("exists", field="Endpoint")
+    s = s.filter("exists", field="machineattrglidein_resourcename0")
+    
+    # Build aggregations:
+    # 1. Group by endpoint (terms aggregation)
+    # 2. Within each endpoint, group by site (nested terms aggregation)
+    # 3. For each endpoint+site combo, calculate:
+    #    - count (doc_count from terms aggregation)
+    #    - sum of transfer_total_bytes (sum aggregation)
+    #    - distinct count of transfer_file_name (cardinality aggregation)
+    #
+    # Note: Field names use .keyword suffix for text fields. If your Elasticsearch
+    # mapping uses different field names or types, you may need to adjust these.
+    
+    # Build the aggregation structure using the aggregation builder
+    # Create the nested aggregation: sites grouped by machineattrglidein_resourcename0
+    # Note: Size limits are set to 1000 to avoid timeouts. If you have more than 1000
+    # unique endpoints or sites per endpoint, increase these values (but queries will take longer)
+    # 
+    # Based on the document structure, trying direct field names first.
+    # If aggregations fail, may need to use .indexed versions (e.g., machineattrglidein_resourcename0.indexed)
+    # or check Elasticsearch mapping for keyword field names
+    site_terms = A('terms', field='machineattrglidein_resourcename0', size=1000)
+    site_terms.metric('total_bytes', 'sum', field='TransferTotalBytes', missing=0)
+    # For cardinality, use the field directly - Elasticsearch will use the appropriate field type
+    site_terms.metric('unique_objects', 'cardinality', field='TransferFileName', missing=0)
+    
+    # Create the top-level aggregation: endpoints grouped by Endpoint
+    endpoint_terms = A('terms', field='Endpoint', size=1000)
+    endpoint_terms.bucket('sites', site_terms)
+    
+    # Add to search
+    s.aggs.bucket('endpoints', endpoint_terms)
+    
+    # Execute the search (we don't need the actual documents, just aggregations)
+    s = s[:0]  # Set size to 0 to only return aggregations
+    
+    print("Executing Elasticsearch aggregation query (this may take a minute for large date ranges)...")
+    try:
+        response = s.execute()
+        print("Aggregation query completed successfully")
+    except Exception as e:
+        print(f"Error executing Elasticsearch query: {e}")
+        # Try to print the query for debugging
+        try:
+            query_dict = s.to_dict()
+            print(f"Query structure: {json.dumps(query_dict, indent=2)[:500]}...")  # First 500 chars
+        except:
+            pass
+        raise
+    
+    # Build map: endpoint -> list of (site, count, total_bytes, unique_objects)
+    endpoint_map = {}
+    
+    # Access aggregations - use dict interface which is more reliable
+    try:
+        aggs_dict = response.aggregations.to_dict() if hasattr(response.aggregations, 'to_dict') else {}
+    except Exception as e:
+        print(f"Error accessing aggregations: {e}")
+        print(f"Response type: {type(response.aggregations)}")
+        print(f"Response aggregations dir: {dir(response.aggregations)}")
+        # Try to access directly
+        try:
+            aggs_dict = dict(response.aggregations) if hasattr(response.aggregations, '__iter__') else {}
+        except:
+            aggs_dict = {}
+    
+    if 'endpoints' not in aggs_dict:
+        print(f"Warning: No 'endpoints' aggregation found. Available aggregations: {list(aggs_dict.keys())}")
+        if aggs_dict:
+            print(f"Full aggregation response: {json.dumps(aggs_dict, indent=2)}")
+        return endpoint_map
+    
+    endpoints_buckets = aggs_dict.get('endpoints', {}).get('buckets', [])
+    
+    if not endpoints_buckets:
+        print("Warning: Aggregation returned 0 endpoints. This could mean:")
+        print("  - No data matches the date range/filters")
+        print("  - Field names don't match Elasticsearch mapping (check Endpoint.keyword and machineattrglidein_resourcename0.keyword)")
+        print("  - Fields might not have .keyword subfields")
+        # Try a simple test query to see if we can get any data
+        print("\nChecking sample documents to diagnose the issue...")
+        test_query = Search(using=client, index=INDEX)[:5]
+        if start is not None and end is not None:
+            test_query = test_query.filter("range", RecordTime={"gte": start, "lte": end})
+        try:
+            test_response = test_query.execute()
+            print(f"Found {len(test_response.hits)} sample documents in date range")
+            if test_response.hits:
+                sample_doc = test_response.hits[0].to_dict()
+                print(f"\nSample document fields: {sorted(sample_doc.keys())}")
+                print(f"  Endpoint field: {sample_doc.get('Endpoint', 'NOT FOUND')}")
+                print(f"  machineattrglidein_resourcename0 field: {sample_doc.get('machineattrglidein_resourcename0', 'NOT FOUND')}")
+                print(f"  TransferTotalBytes field: {sample_doc.get('TransferTotalBytes', 'NOT FOUND')}")
+                print(f"  TransferFileName field: {sample_doc.get('TransferFileName', 'NOT FOUND')}")
+                
+                # Check if exists filters are working
+                exists_query = Search(using=client, index=INDEX)[:0]
+                if start is not None and end is not None:
+                    exists_query = exists_query.filter("range", RecordTime={"gte": start, "lte": end})
+                exists_query = exists_query.filter("exists", field="Endpoint")
+                exists_count = exists_query.count()
+                print(f"\nDocuments with Endpoint field: {exists_count:,}")
+                
+                exists_query2 = Search(using=client, index=INDEX)[:0]
+                if start is not None and end is not None:
+                    exists_query2 = exists_query2.filter("range", RecordTime={"gte": start, "lte": end})
+                exists_query2 = exists_query2.filter("exists", field="machineattrglidein_resourcename0")
+                exists_count2 = exists_query2.count()
+                print(f"Documents with machineattrglidein_resourcename0 field: {exists_count2:,}")
+        except Exception as e:
+            print(f"  Could not fetch sample document: {e}")
+        return endpoint_map
+    
+    for bucket in endpoints_buckets:
+        endpoint = bucket.get('key')
+        if endpoint is None:
+            continue
+        endpoint_map[endpoint] = []
+        
+        sites_buckets = bucket.get('sites', {}).get('buckets', [])
+        for site_bucket in sites_buckets:
+            site = site_bucket.get('key')
+            if site is None:
+                continue
+            count = site_bucket.get('doc_count', 0)
+            total_bytes = int(site_bucket.get('total_bytes', {}).get('value', 0))
+            unique_objects = site_bucket.get('unique_objects', {}).get('value', 0)
+            
+            endpoint_map[endpoint].append((site, count, total_bytes, unique_objects))
+        
+        # Sort sites by count descending
+        endpoint_map[endpoint].sort(key=lambda x: x[1], reverse=True)
+    
+    print(f"Found {len(endpoint_map)} endpoints with {sum(len(sites) for sites in endpoint_map.values())} total site mappings")
+    
+    return endpoint_map
+
+
 def endpoint_to_site_map():
-    """Create a map from endpoint to execution sites (glidein resource names)."""
+    """Create a map from endpoint to execution sites (glidein resource names).
+    
+    This version reads from DuckDB. For better performance with large datasets,
+    use endpoint_to_site_map_from_elasticsearch() instead.
+    """
     conn = duckdb.connect("transfers.duckdb", read_only=True)
     
     result = conn.execute("""
@@ -405,16 +611,28 @@ def endpoint_to_site_map():
     return endpoint_map
 
 
-def build_endpoint_site_data():
-    """Build the endpoint to site mapping with server info as a data structure."""
-    endpoint_map = endpoint_to_site_map()
+def build_endpoint_site_data(use_elasticsearch=False, start=None, end=None):
+    """Build the endpoint to site mapping with server info as a data structure.
+    
+    Args:
+        use_elasticsearch: If True, use Elasticsearch aggregations instead of DuckDB
+        start: Optional start timestamp for Elasticsearch query (Unix timestamp)
+        end: Optional end timestamp for Elasticsearch query (Unix timestamp)
+    """
+    if use_elasticsearch:
+        endpoint_map = endpoint_to_site_map_from_elasticsearch(start=start, end=end)
+    else:
+        endpoint_map = endpoint_to_site_map()
     server_info = load_server_info()
     resource_groups = load_resource_groups()
     
     result = []
-    
+
     for endpoint in sorted(endpoint_map.keys()):
-        sites = endpoint_map[endpoint]
+        # Filter out bare numeric site names (e.g. '2') which are bad/missing data
+        sites = [s for s in endpoint_map[endpoint] if not s[0].isdigit()]
+        if not sites:
+            continue
         total_transfers = sum(count for _, count, _, _ in sites)
         total_bytes = sum(bytes_transferred for _, _, bytes_transferred, _ in sites)
         total_objects = sum(objects for _, _, _, objects in sites)
@@ -424,6 +642,10 @@ def build_endpoint_site_data():
         
         # Build site entries with resource group info
         site_entries = []
+        sites_with_location = 0
+        sites_without_location = 0
+        unmatched_sites = []  # Track sites that don't match for debugging
+        
         for site_name, count, bytes_transferred, unique_objects in sites:
             site_entry = {
                 "name": site_name,
@@ -435,19 +657,36 @@ def build_endpoint_site_data():
             
             # Look up site info from resource groups
             rg = get_site_info(site_name, resource_groups)
-            if rg and rg.get("Site"):
-                site_data = rg["Site"]
-                site_entry["location"] = {
-                    "latitude": site_data.get("Latitude"),
-                    "longitude": site_data.get("Longitude"),
-                    "city": site_data.get("City"),
-                    "country": site_data.get("Country"),
-                    "description": site_data.get("Description"),
-                }
+            if rg:
+                if rg.get("Site"):
+                    site_data = rg["Site"]
+                    # Only add location if we have coordinates
+                    lat = site_data.get("Latitude")
+                    lon = site_data.get("Longitude")
+                    if lat is not None and lon is not None:
+                        site_entry["location"] = {
+                            "latitude": lat,
+                            "longitude": lon,
+                            "city": site_data.get("City"),
+                            "country": site_data.get("Country"),
+                            "description": site_data.get("Description"),
+                        }
+                        sites_with_location += 1
+                    else:
+                        sites_without_location += 1
+                else:
+                    sites_without_location += 1
                 if rg.get("Facility"):
                     site_entry["facility"] = rg["Facility"].get("Name")
+            else:
+                sites_without_location += 1
+                unmatched_sites.append(site_name)
             
             site_entries.append(site_entry)
+        
+        # Print summary for debugging (only if there are unmatched sites)
+        if unmatched_sites and len(unmatched_sites) <= 10:
+            print(f"  Endpoint {endpoint}: Sites not found in resource_group_summary.json: {unmatched_sites[:5]}")
         
         entry = {
             "endpoint": endpoint,
@@ -472,23 +711,38 @@ def build_endpoint_site_data():
         
         result.append(entry)
     
+    # Print summary of site location matching
+    total_sites_with_location = sum(
+        sum(1 for s in entry["sites"] if s.get("location"))
+        for entry in result
+    )
+    total_sites = sum(len(entry["sites"]) for entry in result)
+    if total_sites > 0:
+        print(f"\nSite location summary: {total_sites_with_location}/{total_sites} sites have location data")
+        if total_sites_with_location == 0 and total_sites > 0:
+            # Show sample site names that weren't matched
+            sample_sites = set()
+            for entry in result[:5]:  # Check first 5 endpoints
+                for site in entry["sites"]:
+                    if not site.get("location"):
+                        sample_sites.add(site["name"])
+            if sample_sites:
+                print(f"  Sample unmatched site names: {sorted(list(sample_sites))[:10]}")
+                print(f"  Tip: Check if these names match keys in resource_group_summary.json")
+    
     return result
 
 
-def write_endpoint_site_json(output_file="endpoint_site_map.json"):
+def write_endpoint_site_json(data, output_file="endpoint_site_map.json"):
     """Write the endpoint to site mapping to a JSON file."""
-    data = build_endpoint_site_data()
-    
     with open(output_file, "w") as f:
         json.dump(data, f, indent=2)
-    
+
     print(f"Wrote {len(data)} endpoints to {output_file}")
 
 
-def print_endpoint_site_map():
+def print_endpoint_site_map(data):
     """Print the endpoint to site mapping with server info."""
-    data = build_endpoint_site_data()
-    
     print(f"\nEndpoint to Site Map ({len(data)} endpoints)\n")
     print("=" * 80)
     
@@ -578,7 +832,7 @@ def calculate_arrow_angle(start_lat, start_lon, end_lat, end_lon):
 
 
 def create_transfer_map(output_file="transfer_map.html", show_connections=False, 
-                        site_filter=None, min_transfers=0):
+                        site_filter=None, min_transfers=0, use_elasticsearch=False, start=None, end=None):
     """Create an interactive geographic map of OSDF transfers using Plotly.
     
     Args:
@@ -586,22 +840,43 @@ def create_transfer_map(output_file="transfer_map.html", show_connections=False,
         show_connections: Whether to show transfer flow lines with arrows
         site_filter: If set, only show data related to this site (partial match)
         min_transfers: Minimum number of transfers to include a connection
+        use_elasticsearch: If True, use Elasticsearch aggregations instead of DuckDB
+        start: Optional start timestamp for Elasticsearch query (Unix timestamp)
+        end: Optional end timestamp for Elasticsearch query (Unix timestamp)
     """
-    data = build_endpoint_site_data()
+    data = build_endpoint_site_data(use_elasticsearch=use_elasticsearch, start=start, end=end)
     
     # Filter by site if specified
     if site_filter:
         site_filter_lower = site_filter.lower()
         filtered_data = []
+        
+        # Collect all unique site names for debugging
+        all_site_names = set()
+        for entry in data:
+            for site in entry["sites"]:
+                all_site_names.add(site["name"])
+        
         for entry in data:
             # Filter sites that match the filter
-            matching_sites = [
-                s for s in entry["sites"]
-                if site_filter_lower in s["name"].lower() or 
-                   (s.get("facility") and site_filter_lower in s.get("facility", "").lower()) or
-                   (s.get("location") and s["location"].get("city") and 
-                    site_filter_lower in s["location"]["city"].lower())
-            ]
+            # Try multiple matching strategies:
+            # 1. Direct name match (case-insensitive substring)
+            # 2. Facility name match
+            # 3. City name match
+            # 4. Common abbreviations/aliases
+            matching_sites = []
+            for s in entry["sites"]:
+                site_name_lower = s["name"].lower()
+                matches = (
+                    site_filter_lower in site_name_lower or
+                    site_name_lower in site_filter_lower or  # Also check reverse
+                    (s.get("facility") and site_filter_lower in s.get("facility", "").lower()) or
+                    (s.get("location") and s["location"].get("city") and 
+                     site_filter_lower in s["location"]["city"].lower())
+                )
+                
+                if matches:
+                    matching_sites.append(s)
             if matching_sites:
                 # Keep only matching sites
                 entry_copy = entry.copy()
@@ -609,7 +884,14 @@ def create_transfer_map(output_file="transfer_map.html", show_connections=False,
                 entry_copy["total_transfers"] = sum(s["count"] for s in matching_sites)
                 filtered_data.append(entry_copy)
         data = filtered_data
-        print(f"Filtered to {len(data)} endpoints matching site '{site_filter}'")
+        
+        if not filtered_data:
+            print(f"Warning: No endpoints matched site filter '{site_filter}'")
+            print(f"Available site names (showing first 20): {sorted(list(all_site_names))[:20]}")
+            if len(all_site_names) > 20:
+                print(f"... and {len(all_site_names) - 20} more sites")
+        else:
+            print(f"Filtered to {len(data)} endpoints matching site '{site_filter}'")
     
     # Filter to only endpoints with server location data
     endpoints_with_location = [e for e in data if e.get("server") and e["server"].get("latitude")]
@@ -910,6 +1192,12 @@ def parse_geomap_args():
                         help="Minimum transfers to show a connection (reduces noise)")
     parser.add_argument("-o", "--output", type=str, default="transfer_map.html",
                         help="Output file path (default: transfer_map.html)")
+    parser.add_argument("--use-elasticsearch", action="store_true",
+                        help="Use Elasticsearch aggregations instead of DuckDB (more efficient for large datasets)")
+    parser.add_argument("--start", type=str, default=None,
+                        help="Start date for Elasticsearch query (ISO 8601 or Unix timestamp)")
+    parser.add_argument("--end", type=str, default=None,
+                        help="End date for Elasticsearch query (ISO 8601 or Unix timestamp)")
     return parser.parse_args()
 
 
@@ -917,25 +1205,71 @@ if __name__ == "__main__":
     if len(sys.argv) >= 2:
         cmd = sys.argv[1]
         if cmd == "map":
-            print_endpoint_site_map()
-            write_endpoint_site_json()
+            # Parse optional arguments for map command
+            parser = argparse.ArgumentParser(description="Print and save endpoint-to-site mapping")
+            parser.add_argument("command", help="Command to run (map)")
+            parser.add_argument("--use-elasticsearch", action="store_true",
+                                help="Use Elasticsearch aggregations instead of DuckDB")
+            parser.add_argument("--start", type=str, default=None,
+                                help="Start date for Elasticsearch query (ISO 8601 or Unix timestamp)")
+            parser.add_argument("--end", type=str, default=None,
+                                help="End date for Elasticsearch query (ISO 8601 or Unix timestamp)")
+            args = parser.parse_args()
+
+            # Parse dates if provided
+            start_ts = None
+            end_ts = None
+            if args.start:
+                start_ts = parse_date_arg(args.start)
+            if args.end:
+                end_ts = parse_date_arg(args.end)
+
+            # Build data once and share it between print and JSON write
+            data = build_endpoint_site_data(
+                use_elasticsearch=args.use_elasticsearch,
+                start=start_ts,
+                end=end_ts,
+            )
+            print_endpoint_site_map(data)
+            write_endpoint_site_json(data)
         elif cmd == "geomap":
             args = parse_geomap_args()
+
+            # Parse dates if provided
+            start_ts = None
+            end_ts = None
+            if args.start:
+                start_ts = parse_date_arg(args.start)
+            if args.end:
+                end_ts = parse_date_arg(args.end)
+
             create_transfer_map(
                 output_file=args.output,
                 show_connections=args.connections,
                 site_filter=args.site,
-                min_transfers=args.min_transfers
+                min_transfers=args.min_transfers,
+                use_elasticsearch=args.use_elasticsearch,
+                start=start_ts,
+                end=end_ts
             )
+        elif len(sys.argv) >= 3:
+            # Treat as: python main.py <start> <end>  (Elasticsearch ingest)
+            main()
         else:
             print(f"Unknown command: {cmd}")
             print("Usage:")
             print("  python main.py map                  - Print and save endpoint-to-site mapping")
+            print("  python main.py map --use-elasticsearch --start <date> --end <date> - Use ES aggregations")
             print("  python main.py geomap               - Create geographic map")
             print("  python main.py geomap --connections - Create map with directional flow arrows")
             print("  python main.py geomap --site Wisconsin - Filter to specific site")
             print("  python main.py geomap --min-transfers 100 - Only show connections with 100+ transfers")
-            print("  python main.py <start> <end>        - Fetch data from Elasticsearch")
+            print("  python main.py geomap --use-elasticsearch --start <date> --end <date> - Use ES aggregations")
+            print("  python main.py <start> <end>        - Fetch data from Elasticsearch into DuckDB")
             sys.exit(1)
     else:
-        main()
+        print("Usage:")
+        print("  python main.py map                  - Print and save endpoint-to-site mapping")
+        print("  python main.py geomap               - Create geographic map")
+        print("  python main.py <start> <end>        - Fetch data from Elasticsearch into DuckDB")
+        sys.exit(1)
