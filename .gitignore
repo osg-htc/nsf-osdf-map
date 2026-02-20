@@ -11,3 +11,12 @@ wheels/
 
 # Environment variables
 .env
+
+# JSON files
+*.json
+
+# HTML files
+*.html
+
+# DuckDB files
+*.duckdb
