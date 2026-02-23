@@ -199,3 +199,10 @@ nsf-osdf-map/
 ├── endpoint_site_map.json       # Aggregated mapping output (generated)
 └── transfer_map.html            # Interactive map output (generated)
 ```
+
+## Running With Docker
+
+```bash
+docker build -t nsf-osdf-map .
+docker run -v $(pwd):/app nsf-osdf-map python map --use-elasticsearch --start 2025-01-01T06:00:00.000Z --end 2026-01-01T06:00:00.000Z
+```
