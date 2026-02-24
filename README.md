@@ -204,5 +204,14 @@ nsf-osdf-map/
 
 ```bash
 docker build -t nsf-osdf-map .
-docker run -v $(pwd):/app nsf-osdf-map python map --use-elasticsearch --start 2025-01-01T06:00:00.000Z --end 2026-01-01T06:00:00.000Z
+docker run -v $(pwd):/app nsf-osdf-map map --use-elasticsearch --start 2025-01-01 --end 2026-01-01
+
+
+docker run --rm \
+  -v $(pwd):/app \
+  -e ELASTIC_HOST="https://elastic.osg.chtc.io/q" \
+  -e ELASTIC_USER="adstash-reader" \
+  -e ELASTIC_PASSWORD="ZZlz3L0x37hObtydr9le6WudRp7oAaJlEFP9ZgGwWDo85qAXiSGpXMMIfn1PGtiO" \
+  nsf-osdf-map map --use-elasticsearch --start $START_DATE --end $END_DATE
+
 ```

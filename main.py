@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 import urllib.request
 import plotly.graph_objects as go
 import argparse
+from collections import defaultdict
 
 INDEX = "adstash-ospool-transfer-*"
 BATCH_SIZE = 10000  # Larger batches for efficiency
@@ -385,6 +386,14 @@ def load_resource_groups(resource_file="resource_group_summary.json"):
     return lookup
 
 
+def load_topology_institutions(topology_file="topology_institutions.json"):
+    """Load institution info from the OSG topology API, with caching."""
+    raw = _fetch_json("https://topology-institutions.osg-htc.org/api/institution_ids", topology_file)
+    if not raw:
+        return {}
+    return {i['id']: i for i in raw}
+
+
 def get_site_info(site_name, resource_groups):
     """Get site info from resource groups, with flexible matching."""
     # Try exact match
@@ -625,6 +634,7 @@ def build_endpoint_site_data(use_elasticsearch=False, start=None, end=None):
         endpoint_map = endpoint_to_site_map()
     server_info = load_server_info()
     resource_groups = load_resource_groups()
+    topology_institutions = load_topology_institutions()
     
     result = []
 
@@ -641,48 +651,36 @@ def build_endpoint_site_data(use_elasticsearch=False, start=None, end=None):
         server = lookup_server(endpoint, server_info)
         
         # Build site entries with resource group info
-        site_entries = []
+        institution_entries = defaultdict(lambda: {"count": 0, "bytes": 0, "objects": 0, "sites": set()})
         sites_with_location = 0
         sites_without_location = 0
         unmatched_sites = []  # Track sites that don't match for debugging
         
         for site_name, count, bytes_transferred, unique_objects in sites:
-            site_entry = {
-                "name": site_name,
-                "count": count,
-                "bytes": bytes_transferred,
-                "objects": unique_objects,
-                "percentage": round(100 * count / total_transfers, 2)
-            }
             
             # Look up site info from resource groups
             rg = get_site_info(site_name, resource_groups)
-            if rg:
-                if rg.get("Site"):
-                    site_data = rg["Site"]
-                    # Only add location if we have coordinates
-                    lat = site_data.get("Latitude")
-                    lon = site_data.get("Longitude")
-                    if lat is not None and lon is not None:
-                        site_entry["location"] = {
-                            "latitude": lat,
-                            "longitude": lon,
-                            "city": site_data.get("City"),
-                            "country": site_data.get("Country"),
-                            "description": site_data.get("Description"),
-                        }
-                        sites_with_location += 1
-                    else:
-                        sites_without_location += 1
-                else:
-                    sites_without_location += 1
-                if rg.get("Facility"):
-                    site_entry["facility"] = rg["Facility"].get("Name")
-            else:
-                sites_without_location += 1
+            if rg is None:
                 unmatched_sites.append(site_name)
-            
-            site_entries.append(site_entry)
+                continue
+            institution = topology_institutions.get(rg["Facility"].get("InstitutionID"))
+            if institution is None:
+                sites_without_location += 1
+                print(f"Warning: Institution ID {rg['Facility'].get('InstitutionID')} not found in topology_institutions.json for site {site_name}")
+                return
+
+            existing_entry = institution_entries[institution['name']]
+            new_entry = {
+                "count": existing_entry["count"] + count,
+                "bytes": existing_entry["bytes"] + bytes_transferred,
+                "objects": existing_entry["objects"] + unique_objects,
+                "sites": {*existing_entry["sites"], site_name},
+                **institution
+            }
+
+            institution_entries[institution['name']] = new_entry
+
+            sites_with_location += 1
         
         # Print summary for debugging (only if there are unmatched sites)
         if unmatched_sites and len(unmatched_sites) <= 10:
@@ -693,7 +691,7 @@ def build_endpoint_site_data(use_elasticsearch=False, start=None, end=None):
             "total_transfers": total_transfers,
             "total_bytes": total_bytes,
             "total_objects": total_objects,
-            "sites": site_entries
+            "institutions": [*institution_entries.values()]
         }
         
         if server:
@@ -708,28 +706,13 @@ def build_endpoint_site_data(use_elasticsearch=False, start=None, end=None):
                 "version": server.get("version"),
                 "url": server.get("url"),
             }
+
+        # Run through and convert all institution sets to lists for JSON serialization
+        for institution_data in entry["institutions"]:
+            institution_data["sites"] = list(institution_data["sites"])
         
         result.append(entry)
-    
-    # Print summary of site location matching
-    total_sites_with_location = sum(
-        sum(1 for s in entry["sites"] if s.get("location"))
-        for entry in result
-    )
-    total_sites = sum(len(entry["sites"]) for entry in result)
-    if total_sites > 0:
-        print(f"\nSite location summary: {total_sites_with_location}/{total_sites} sites have location data")
-        if total_sites_with_location == 0 and total_sites > 0:
-            # Show sample site names that weren't matched
-            sample_sites = set()
-            for entry in result[:5]:  # Check first 5 endpoints
-                for site in entry["sites"]:
-                    if not site.get("location"):
-                        sample_sites.add(site["name"])
-            if sample_sites:
-                print(f"  Sample unmatched site names: {sorted(list(sample_sites))[:10]}")
-                print(f"  Tip: Check if these names match keys in resource_group_summary.json")
-    
+
     return result
 
 
@@ -1230,7 +1213,7 @@ if __name__ == "__main__":
                 start=start_ts,
                 end=end_ts,
             )
-            print_endpoint_site_map(data)
+            # print_endpoint_site_map(data)
             write_endpoint_site_json(data)
         elif cmd == "geomap":
             args = parse_geomap_args()
