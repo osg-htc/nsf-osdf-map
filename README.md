@@ -209,9 +209,6 @@ docker run -v $(pwd):/app nsf-osdf-map map --use-elasticsearch --start 2025-01-0
 
 docker run --rm \
   -v $(pwd):/app \
-  -e ELASTIC_HOST="https://elastic.osg.chtc.io/q" \
-  -e ELASTIC_USER="adstash-reader" \
-  -e ELASTIC_PASSWORD="ZZlz3L0x37hObtydr9le6WudRp7oAaJlEFP9ZgGwWDo85qAXiSGpXMMIfn1PGtiO" \
   nsf-osdf-map map --use-elasticsearch --start $START_DATE --end $END_DATE
 
 ```

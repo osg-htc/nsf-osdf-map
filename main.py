@@ -636,27 +636,51 @@ def build_endpoint_site_data(use_elasticsearch=False, start=None, end=None):
     resource_groups = load_resource_groups()
     topology_institutions = load_topology_institutions()
     
-    result = []
 
+    servers = defaultdict(lambda: {'sites': defaultdict(lambda: {'count': 0, 'bytes': 0, 'objects': 0}), 'endpoints': [], 'server': {}})
     for endpoint in sorted(endpoint_map.keys()):
         # Filter out bare numeric site names (e.g. '2') which are bad/missing data
         sites = [s for s in endpoint_map[endpoint] if not s[0].isdigit()]
         if not sites:
             continue
-        total_transfers = sum(count for _, count, _, _ in sites)
-        total_bytes = sum(bytes_transferred for _, _, bytes_transferred, _ in sites)
-        total_objects = sum(objects for _, _, _, objects in sites)
-        
         # Look up server info
         server = lookup_server(endpoint, server_info)
-        
+        if server is None:
+            print(f"Warning: No server info found for endpoint {endpoint}")
+            print(f"We have missed out on accounting {sum(x[1] for x in sites)} transfers and {format_bytes(sum(x[2] for x in sites))} for sites {[s[0] for s in sites]} associated with this endpoint.")
+            continue
+
+        for site in sites:
+            name, count, bytes, objects = site
+
+            servers[server['name']]['sites'][name]['count'] += count
+            servers[server['name']]['sites'][name]['bytes'] += bytes
+            servers[server['name']]['sites'][name]['objects'] += objects
+
+        servers[server['name']]['endpoints'].append(endpoint)
+        servers[server['name']]['server'] = server
+
+
+    result = []
+    for server in servers.values():
+
+        sites = server['sites']
+
+        total_transfers = sum(s['count'] for s in sites.values())
+        total_bytes = sum(s['bytes'] for s in sites.values())
+        total_objects = sum(s['objects'] for s in sites.values())
+
         # Build site entries with resource group info
         institution_entries = defaultdict(lambda: {"count": 0, "bytes": 0, "objects": 0, "sites": set()})
         sites_with_location = 0
         sites_without_location = 0
         unmatched_sites = []  # Track sites that don't match for debugging
         
-        for site_name, count, bytes_transferred, unique_objects in sites:
+        for site_name, data in sites.items():
+
+            count = data['count']
+            bytes_transferred = data['bytes']
+            unique_objects = data['objects']
             
             # Look up site info from resource groups
             rg = get_site_info(site_name, resource_groups)
@@ -687,25 +711,13 @@ def build_endpoint_site_data(use_elasticsearch=False, start=None, end=None):
             print(f"  Endpoint {endpoint}: Sites not found in resource_group_summary.json: {unmatched_sites[:5]}")
         
         entry = {
-            "endpoint": endpoint,
+            "endpoints": server['endpoints'],
             "total_transfers": total_transfers,
             "total_bytes": total_bytes,
             "total_objects": total_objects,
-            "institutions": [*institution_entries.values()]
+            "institutions": [*institution_entries.values()],
+            "server": server['server']
         }
-        
-        if server:
-            entry["server"] = {
-                "name": server.get("name"),
-                "type": server.get("type"),
-                "latitude": server.get("latitude"),
-                "longitude": server.get("longitude"),
-                "namespaces": server.get("namespacePrefixes", []),
-                "health_status": server.get("healthStatus"),
-                "server_status": server.get("serverStatus"),
-                "version": server.get("version"),
-                "url": server.get("url"),
-            }
 
         # Run through and convert all institution sets to lists for JSON serialization
         for institution_data in entry["institutions"]:
